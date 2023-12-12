@@ -1,0 +1,320 @@
+import telebot
+import configure
+import  lib 
+import sqlite3
+from telebot import types
+import threading
+from datetime import datetime
+ 
+#Подключение к боту
+bot = telebot.TeleBot(configure.config['token'])
+ 
+#Подключение базы данных
+db = sqlite3.connect('der.db', check_same_thread=False)
+sql = db.cursor()
+ 
+#Подключения блокировщика потока 
+lock = threading.Lock()
+ 
+@bot.message_handler(commands=['start'])
+def welcome(message):
+    #Проверка на тип чата
+    if message.chat.type == 'private':
+            markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+            btn1 = types.KeyboardButton("Посмотреть товары")
+            btn2 = types.KeyboardButton("Корзина")
+            btn3 = types.KeyboardButton("Обратиться в поддержку")
+            btn4 = types.KeyboardButton("Написать отзыв")
+            markup.add(btn1, btn2, btn3, btn4)
+            bot.send_message(message.chat.id, lib.welcome_mes,parse_mode= 'html',reply_markup=markup)  
+    elif message.chat.type == 'supergroup' and message.chat.id == configure.config['groupid']:
+        bot.send_message(message.chat.id, 'Здравствуйте, коллеги!',parse_mode= 'html') 
+    
+ 
+#Функция, принимающая текст пользователя или нажатые кнопки на нижней панели   
+@bot.message_handler(content_types=['text'])
+def func(message):
+    #Проверка нажатия определённой кнопки. Так же будет работать, если ввести сообщение вручную
+    if message.text == "Посмотреть товары":  
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        item1 = types.InlineKeyboardButton("Посмотреть все товары",callback_data='vse_tovary')
+        item2 = types.InlineKeyboardButton("Посмотреть стулья",callback_data='stulya')
+        item3 = types.InlineKeyboardButton("Посмотреть столы",callback_data='stoly')
+        item4 = types.InlineKeyboardButton("Посмотреть кровати",callback_data='bed')
+        markup.add(item1, item2, item3, item4)
+        
+        bot.send_message(message.chat.id, lib.view_products_mes,parse_mode= 'html',reply_markup=markup)
+    elif message.text == "Корзина":
+        #Блокировка потока для синхронизации доступа к БД
+        with lock:
+            tovary = sql.execute(f"SELECT tovar_article, name, price, count FROM basket JOIN tovary on tovary.article = basket.tovar_article WHERE basket.id_user = '{message.from_user.id}'")
+        #Функция выводит информацию о товарах
+        text = lib.view_basket(tovary)
+        
+        markup = types.InlineKeyboardMarkup()
+        item1 = types.InlineKeyboardButton(text='Приступить к оформлению', callback_data='buy')
+        item2 = types.InlineKeyboardButton(text='Удалить определённый товар из корзины', callback_data='deltovar')
+        item3 = types.InlineKeyboardButton(text='Очистить корзину', callback_data='delall')
+        markup.add(item1, item2, item3)
+        
+        bot.send_message(message.chat.id, text,parse_mode= 'html',reply_markup=markup)
+    elif message.text == "Обратиться в поддержку":       
+        markup = types.InlineKeyboardMarkup()
+        item1 = types.InlineKeyboardButton(text='Проблемы с доставкой', callback_data='delivery_problem')
+        item2 = types.InlineKeyboardButton(text='Проблема с товаром', callback_data='tovar_problem')
+        item3 = types.InlineKeyboardButton(text='Хочу вернуть товар', callback_data='return_tovar')
+        markup.add(item1, item2, item3)
+        bot.send_message(message.chat.id, 'Какие у вас возникли проблемы?',parse_mode= 'html',reply_markup=markup)           
+    elif message.text == "Написать отзыв":
+        #Выводит сообщение с шаблоном для отзыва
+        msg = bot.send_message(message.chat.id, lib.addmark_mes)
+        #Функция, принимающая сообщения от пользователя и проверяющая шаблон
+        bot.register_next_step_handler(msg, process_addmark_step)     
+ 
+ 
+#Функция, которая срабатывает при нажатии кнопки под сообщением
+@bot.callback_query_handler(func = lambda call: True)
+def callback_inline(call): 
+    try:
+        chat_id= call.message.chat.id   
+        #Выводит все товары                         
+        if call.data == 'vse_tovary': 
+            with lock:
+                tovary = sql.execute("SELECT * FROM tovary")
+            for tovar in tovary:                
+                #Функция вписывает информацию о товаре в массив
+                resp = lib.view_tovary(tovar)
+                bot.send_photo(chat_id, resp[1],  resp[0],parse_mode='html',reply_markup=resp[2])
+        #Выводит товары типа стул
+        elif call.data == 'stulya':
+            with lock:
+                tovary = sql.execute("SELECT * FROM tovary where type = 'Стул'")   
+            for tovar in tovary:
+                resp = lib.view_tovary(tovar)
+                bot.send_photo(chat_id, resp[1],  resp[0],parse_mode='html',reply_markup=resp[2])    
+        #Выводит товары типа стол
+        elif call.data == 'stoly':
+            with lock:
+                tovary = sql.execute("SELECT * FROM tovary where type = 'Стол'")
+            for tovar in tovary:
+                resp = lib.view_tovary(tovar)
+                bot.send_photo(chat_id, resp[1],  resp[0],parse_mode='html',reply_markup=resp[2]) 
+        #Выводит товары типа кровать
+        elif call.data == 'bed':
+            with lock:
+                tovary = sql.execute("SELECT * FROM tovary where type = 'Кровать'")
+            for tovar in tovary:
+                resp = lib.view_tovary(tovar)
+                bot.send_photo(chat_id, resp[1],  resp[0],parse_mode='html',reply_markup=resp[2])   
+        #Добавляет товар в корзину
+        elif call.data == 'addtovar':
+            text = call.message.caption
+            id_user = call.from_user.id 
+            art_index = text.find('Артикул')
+            if art_index != -1:
+                article = text[art_index+9:art_index+12]   
+                #Добавляет запись в БД
+                with lock:
+                    sql.execute("INSERT INTO basket  (id_user,tovar_article) VALUES (?, ?);", (f"{id_user}", f"{article}"))
+                    db.commit()   
+                msg = bot.send_message(chat_id, 'Пожалуйста, введите количество товара')
+                #Функция для записи количества товара, которое желают купить
+                bot.register_next_step_handler(msg, process_addtovar_step)  
+        #Удаляет товар из корзины
+        elif call.data == 'deltovar':
+            msg = bot.send_message(chat_id, lib.deltovar_mes)
+            #Функция выбора пользователем товара, который он хочет удалить
+            bot.register_next_step_handler(msg, process_deltovar_step)
+        #Очищает корзину
+        elif call.data == 'delall':
+            lib.clear_basket(sql,db, call.from_user.id) 
+            bot.send_message(chat_id, "Корзина очищена")
+        #Выводит отзывы по товару
+        elif call.data == 'view_review':
+            text = call.message.caption
+            art_index = text.find('Артикул')
+ 
+            article = text[art_index+9:art_index+12]     
+            text = "Отзывы к товару "+article+"\n"
+            for mark in sql.execute(f"SELECT mark, comment FROM mark WHERE tovar_article = '{str(article)}'"):
+                if mark[1] != None:
+                    comment = mark[1].replace('_',' ')
+                    text += f"Оценка: {mark[0]}\nКомментарий: {comment}\n"
+                elif  mark[1] == None:
+                    text += f"Оценка: {mark[0]}\n"
+                else:
+                    bot.send_message(chat_id, "Комментарии отсутсвуют")    
+            bot.send_message(chat_id, text)
+        #Отправляет запрос на покупку в чат менеджеров
+        elif call.data == 'buy':
+            if call.from_user.username == None:
+                bot.send_message(chat_id, 'Для связи с менеджером необходимо иметь username') 
+            else:
+                bot.send_message(chat_id, lib.response_user_mes) 
+                ticket_mes = 'покупка товара'
+                
+                #Создаёт шаблон сообщения для чата менеджеров
+                ticket_template= lib.ticket_template()
+                text = ticket_template[0]+ticket_mes
+                msg = bot.send_message(configure.config['groupid'], text ,parse_mode='html', reply_markup=ticket_template[1])
+                #Функция создаёт запись в БД
+                lib.write_ticket(sql,db, call.from_user.id, ticket_mes, msg.id, datetime.now(), call.from_user.username) 
+        #Отправляет запрос о проблеме с доставкой в чат менеджеров
+        elif call.data == 'delivery_problem':
+            if call.from_user.username == None:
+                bot.send_message(chat_id, 'Для связи с менеджером необходимо иметь username') 
+            else:
+                bot.send_message(chat_id, lib.response_user_mes) 
+                ticket_mes = 'проблема с доставкой'
+                
+                ticket_template= lib.ticket_template()
+                text = ticket_template[0]+ticket_mes
+         
+                msg = bot.send_message(configure.config['groupid'], text ,parse_mode='html', reply_markup=ticket_template[1])
+                lib.write_ticket(sql,db, call.from_user.id, ticket_mes, msg.id, datetime.now(), call.from_user.username)    
+        #Отправляет запрос о проблеме с товаром в чат менеджеров
+        elif call.data == 'tovar_problem':
+            if call.from_user.username == None:
+                bot.send_message(chat_id, 'Для связи с менеджером необходимо иметь username') 
+            else:
+                bot.send_message(chat_id, lib.response_user_mes) 
+                ticket_mes = 'проблема с товаром'
+                
+                ticket_template= lib.ticket_template()
+                text = ticket_template[0]+ticket_mes
+         
+                msg = bot.send_message(configure.config['groupid'], text ,parse_mode='html', reply_markup=ticket_template[1])
+                lib.write_ticket(sql,db, call.from_user.id, ticket_mes, msg.id, datetime.now(), call.from_user.username)   
+        #Отправляет запрос о возвращении товара
+        elif call.data =='return_tovar':
+            if call.from_user.username == None:
+                bot.send_message(chat_id, 'Для связи с менеджером необходимо иметь username') 
+            else:
+                bot.send_message(chat_id, lib.response_user_mes) 
+                ticket_mes = 'возврат'
+                
+                ticket_template= lib.ticket_template()
+                text = ticket_template[0]+ticket_mes
+         
+                msg = bot.send_message(configure.config['groupid'], text ,parse_mode='html', reply_markup=ticket_template[1])
+                lib.write_ticket(sql,db, call.from_user.id, ticket_mes, msg.id, datetime.now(), call.from_user.username)  
+        #Привязывает запрос к менеджеру и отправляет ему подробности запроса
+        elif call.data =='accept_ticket':
+            id_manager = call.from_user.id
+            with lock:
+                resp = sql.execute(f"SELECT * FROM tickets WHERE id_message = '{call.message.id}'")
+            ticket = resp.fetchone()
+            #Изменяет сообщение в чате менеджеров и убирает возможность привязки к задаче
+            bot.edit_message_text(text = f"<b>Менеджер:</b> {call.from_user.username}\n<b>Принял запрос:</b> {ticket[3]}\n<b>Дата:</b> {ticket[4]}",chat_id = chat_id,message_id = 
+call.message.message_id,reply_markup=None,parse_mode= 'html')    
+            text = f"<b>Запрос от:</b> {ticket[6]}\n<b>Цель:</b> {ticket[3]}\n<b>Дата:</b> {ticket[4]}\n"
+            
+            #Добавления корзины покупателя к сообщению для менеджера, если запрос является покупкой товара
+            if ticket[3] == 'покупка товара':
+                view_basket_request = lib.view_basket_request+f"{ticket[2]}"
+                tovary = sql.execute(view_basket_request)
+                text += lib.view_basket(tovary)
+                
+            markup = types.InlineKeyboardMarkup()
+            item1 = types.InlineKeyboardButton(text='Выполнено', callback_data='done_ticket')
+            markup.add(item1)
+                
+            msg = bot.send_message(id_manager, text , parse_mode='html', reply_markup=markup)
+            with lock:    
+                sql.execute(f"UPDATE tickets SET id_manager = '{id_manager}', id_task_message = '{msg.id}' WHERE id = '{ticket[0]}'")
+                db.commit()
+        #Закрывает тикет       
+        elif call.data == 'done_ticket':
+            with lock:
+                ticket = sql.execute(f"SELECT id,id_message, date, problem, id_user  FROM tickets WHERE id_task_message = '{call.message.id}' and id_manager = '{call.from_user.id}' and done = 0").fetchone()
+                sql.execute(f"UPDATE tickets SET done = 1 WHERE id = '{ticket[0]}'")
+                db.commit()   
+            #Сообщение в чате менеджеров
+            bot.edit_message_text(text = f"<b>Менеджер:</b> {call.from_user.username}\n<b>Выполнил запрос:</b> {ticket[3]}\n<b>Дата запроса:</b> {ticket[2]}\n<b>Id запроса:</b> {ticket[0]}",chat_id = 
+configure.config['groupid'],message_id = ticket[1],reply_markup=None,parse_mode= 'html')    
+            #Сообщение в личных сообщениях
+            bot.edit_message_text(text = call.message.text+'\n<b>ВЫПОЛНЕНО</b>',chat_id = chat_id,message_id = 
+call.message.message_id,reply_markup=None,parse_mode= 'html')
+            
+            #Очищает корзину пользователя, если запрос являлся покупкой товара
+            if ticket[3] == 'покупка товара':
+                lib.clear_basket(sql,db, ticket[4]) 
+    except:
+        bot.send_message(chat_id, lib.error_mes)
+ 
+#Фуннкция принимает сообщение о количестве товара, который хочет купить клиент
+def process_addtovar_step(message):
+        try:
+                parse = message.text.replace(' ', '')
+                #Проверка на корректность сообщения
+                if parse != '' and parse.isdigit():
+                    with lock:
+                        sql.execute(f"update basket set count = '{parse}' where id_user = '{message.from_user.id}' and count = 0;")
+                        db.commit()
+                    bot.send_message(message.chat.id, 'Товар добавлен в корзину',parse_mode= 'html')     
+                else:
+                    bot.send_message(message.chat.id, 'Пожалуйста, введите количество товара')
+                    bot.register_next_step_handler(message, process_addtovar_step)                                  
+        except:
+            bot.send_message(message.chat.id, lib.error_mes)
+#Функция принимает артикул товара для удаления
+def process_deltovar_step(message): 
+    try:
+            parse = message.text.replace(' ', '')
+            if parse != '':
+                id_user = str(message.from_user.id)
+                with lock:
+                    resp = sql.execute(f"SELECT id FROM basket where id_user= '{id_user}' and tovar_article= '{parse}'")
+                rows = resp.fetchall()
+                for row in rows:
+                    if row !=None:    
+                        with lock:
+                            sql.execute(f"DELETE from basket where id = {row[0]}")
+                            db.commit()
+                        bot.send_message(message.chat.id, 'Товар удалён из корзины',parse_mode= 'html')   
+                return()                    
+ 
+            bot.send_message(message.chat.id, 'Не удалось найти данный товар в корзине')                             
+    except:
+        bot.send_message(message.chat.id, lib.error_mes)
+#Функция принимает шаблон отзыва и вписывает его в БД
+def process_addmark_step(message): 
+    parse = message.text.split(';')  
+    if len(parse)>1:
+        parse[0] = parse[0].replace(' ', '')
+        parse[1] = parse[1].replace(' ', '')
+        
+        if parse[0] != '' and parse[1].isdigit() and int(parse[1]) < 6 and int(parse[1]) >= 0:
+            with lock:
+                resp = sql.execute(f"SELECT avg_mark FROM tovary WHERE article = '{parse[0]}'")
+            row = resp.fetchone()
+            if row != None:
+                #Проверка на наличие комментария в отзыве
+                if len(parse) > 2:
+                    parse[2] = parse[2].replace(' ', '_')
+                    with lock:
+                        sql.execute("INSERT INTO mark (id_user,tovar_article, mark, comment) VALUES (?, ?, ?, ?);", 
+(f"{message.from_user.id}", f"{parse[0]}", f"{parse[1]}", f"{parse[2]}"))
+                        db.commit()       
+                else:
+                    with lock:
+                        sql.execute("INSERT INTO mark (id_user,tovar_article, mark) VALUES (?, ?, ?);", 
+(f"{message.from_user.id}", f"{parse[0]}", f"{parse[1]}"))
+                        db.commit() 
+                if row[0] != None:
+                    avg_mark = (float(parse[1])+float(row[0]))/2
+                    with lock:
+                        sql.execute(f"UPDATE tovary SET avg_mark = '{avg_mark}' WHERE article = '{parse[0]}'")
+                        db.commit()
+                else:
+                    with lock:
+                        sql.execute(f"UPDATE tovary SET avg_mark = '{parse[1]}' WHERE article = '{parse[0]}'")
+                        db.commit()
+                bot.send_message(message.chat.id, 'Отзыв написан',parse_mode= 'html')
+                return()
+ 
+    msg = bot.send_message(message.chat.id, lib.addmark_mes)
+    bot.register_next_step_handler(msg, process_addmark_step)     
+ 
+#Запуск потока бота        
+bot.polling(none_stop=True,interval=0)
